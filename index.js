@@ -3,6 +3,7 @@ require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
 const { DisTube, RepeatMode } = require('distube');
 const { YtDlpPlugin } = require('@distube/yt-dlp');
+const { SoundCloudPlugin } = require('@distube/soundcloud');
 const ffmpegStatic = require('ffmpeg-static');
 const Anthropic = require('@anthropic-ai/sdk');
 
@@ -27,9 +28,12 @@ const client = new Client({
 const distube = new DisTube(client, {
     emitNewSongOnly: true,
     ffmpeg: { path: ffmpegStatic },
-    plugins: [new YtDlpPlugin({
+    plugins: [new SoundCloudPlugin(), new YtDlpPlugin({
         update: false,
-        ytdlpArgs: ['--cookies', '/home/ubuntu/zyn-bot/cookies.txt'],
+        ytdlpArgs: [
+            '--cookies', '/home/ubuntu/zyn-bot/cookies.txt',
+            '--extractor-args', 'youtube:player_client=web',
+        ],
     })],
 });
 
