@@ -27,7 +27,10 @@ const client = new Client({
 const distube = new DisTube(client, {
     emitNewSongOnly: true,
     ffmpeg: { path: ffmpegStatic },
-    plugins: [new YtDlpPlugin({ update: false })],
+    plugins: [new YtDlpPlugin({
+        update: false,
+        ytdlpArgs: ['--cookies', '/home/ubuntu/zyn-bot/cookies.txt'],
+    })],
 });
 
 // ── YouTube search ────────────────────────────────────────────────────────────
