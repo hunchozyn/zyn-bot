@@ -289,7 +289,7 @@ function fmtMs(ms) {
 
 // ── Bot ready ─────────────────────────────────────────────────────────────────
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
     await lavalinkClient.init(client.user.id);
 });
