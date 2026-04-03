@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
-const { LavalinkClient } = require('lavalink-client');
+const { LavalinkManager } = require('lavalink-client');
 const Anthropic = require('@anthropic-ai/sdk');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -20,7 +20,7 @@ const client = new Client({
 
 // ── Lavalink client ───────────────────────────────────────────────────────────
 
-const lavalinkClient = new LavalinkClient({
+const lavalinkClient = new LavalinkManager({
     nodes: [{
         authorization: 'zynbot',
         host: 'localhost',
