@@ -249,6 +249,19 @@ function pickBestTrack(tracks, query) {
     return { track: scored[0].track, gap };
 }
 
+// Returns the gap threshold below which the match is considered too weak to autoplay.
+// Type A (song + artist): gap < 3  — user stated both title and artist explicitly
+// Type B (artist-only):   gap < 4  — short query, SC ranking is reliable for artists
+// Type C (vague/song):    gap < 8  — default strict check
+function classifyQuery(query) {
+    const lq = query.toLowerCase().trim();
+    const songArtistConnectors = /\b(by|feat\.?|ft\.?)\b/;
+    if (songArtistConnectors.test(lq)) return 3;           // Type A
+    const words = lq.split(/\s+/).filter(w => w.length > 0);
+    if (words.length <= 3) return 4;                       // Type B
+    return 8;                                              // Type C
+}
+
 async function searchAndQueue(player, query, requestedBy, { confidenceCheck = false } = {}) {
     const isUrl = query.startsWith('http://') || query.startsWith('https://');
     const searchQuery = isUrl ? query : `scsearch:${query}`;
@@ -264,7 +277,7 @@ async function searchAndQueue(player, query, requestedBy, { confidenceCheck = fa
         track = result.tracks[0];
     } else {
         const { track: best, gap } = pickBestTrack(result.tracks, query);
-        if (confidenceCheck && gap < 8) {
+        if (confidenceCheck && gap < classifyQuery(query)) {
             return {
                 weakMatch: true,
                 hint: `Couldn't find a confident match for **${query}**.\nTry adding the artist name — for example: \`!play ${query} <artist>\``,
