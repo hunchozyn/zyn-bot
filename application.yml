@@ -1,0 +1,51 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  pluginsDir: ./plugins
+  server:
+    password: "zynbot"
+    sources:
+      youtube: false
+      bandcamp: true
+      soundcloud: true
+      twitch: false
+      vimeo: false
+      http: true
+      local: false
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: true
+      timescale: true
+      tremolo: true
+      vibrato: true
+      distortion: true
+      rotation: true
+      channelMix: true
+      lowPass: true
+
+plugins:
+  lavasrc:
+    # Spotify + YouTube audio resolution disabled — playback source is now SoundCloud (scsearch).
+    # Spotify credentials retained as env vars in case source is re-enabled later.
+    providers: []
+    sources:
+      spotify: false
+      appleMusic: false
+      deezer: false
+      yandexMusic: false
+      flowerytts: false
+      youtube: false
+    spotify:
+      clientId: "${SPOTIFY_CLIENT_ID}"
+      clientSecret: "${SPOTIFY_CLIENT_SECRET}"
+      countryCode: "US"
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+
+logging:
+  level:
+    root: INFO
+    lavalink: INFO

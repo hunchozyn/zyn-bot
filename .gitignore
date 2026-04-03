@@ -1,2 +1,7 @@
 .env
 node_modules/
+cookies.txt
+www.youtube.com_cookies.txt
+
+# application.yml contains no hardcoded secrets after env-var refactor,
+# but never re-add plaintext credentials to this file.

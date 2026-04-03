@@ -1,20 +1,13 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits } = require('discord.js');
-const { DisTube, RepeatMode } = require('distube');
-const { YtDlpPlugin } = require('@distube/yt-dlp');
-const { SoundCloudPlugin } = require('@distube/soundcloud');
-const ffmpegStatic = require('ffmpeg-static');
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { LavalinkClient } = require('lavalink-client');
 const Anthropic = require('@anthropic-ai/sdk');
 
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-if (!YOUTUBE_API_KEY) {
-    console.error('ERROR: Set YOUTUBE_API_KEY in your .env file.');
-    process.exit(1);
-}
+// ── Discord client ────────────────────────────────────────────────────────────
 
 const client = new Client({
     intents: [
@@ -25,38 +18,33 @@ const client = new Client({
     ],
 });
 
-const distube = new DisTube(client, {
-    emitNewSongOnly: true,
-    ffmpeg: { path: ffmpegStatic },
-    plugins: [new SoundCloudPlugin(), new YtDlpPlugin({
-        update: false,
-        ytdlpArgs: [
-            '--cookies', '/home/ubuntu/zyn-bot/cookies.txt',
-            '--extractor-args', 'youtube:player_client=web',
-        ],
-    })],
+// ── Lavalink client ───────────────────────────────────────────────────────────
+
+const lavalinkClient = new LavalinkClient({
+    nodes: [{
+        authorization: 'zynbot',
+        host: 'localhost',
+        port: 2333,
+        id: 'main',
+    }],
+    sendToShard: (guildId, payload) =>
+        client.guilds.cache.get(guildId)?.shard.send(payload),
+    autoSkipOnResolveError: true,
+    playerOptions: {
+        defaultSearchPlatform: 'scsearch',
+        volumeDecrementer: 0.75,
+    },
+    queueOptions: {
+        maxPreviousTracks: 10,
+    },
 });
 
-// ── YouTube search ────────────────────────────────────────────────────────────
-
-async function searchYouTube(query) {
-    const params = new URLSearchParams({
-        part: 'snippet',
-        q: query,
-        type: 'video',
-        maxResults: '1',
-        key: YOUTUBE_API_KEY,
-    });
-    const res = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
-    if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.error?.message || `YouTube API error ${res.status}`);
-    }
-    const data = await res.json();
-    const videoId = data.items?.[0]?.id?.videoId;
-    if (!videoId) return null;
-    return `https://www.youtube.com/watch?v=${videoId}`;
-}
+lavalinkClient.on('nodeConnect', node =>
+    console.log(`Lavalink node "${node.id}" connected.`));
+lavalinkClient.on('nodeDisconnect', (node, reason) =>
+    console.warn(`Lavalink node "${node.id}" disconnected:`, reason));
+lavalinkClient.on('nodeError', (node, error) =>
+    console.error(`Lavalink node "${node.id}" error:`, error));
 
 // ── Claude / Zyn brain ────────────────────────────────────────────────────────
 
@@ -163,11 +151,152 @@ function isRateLimited(userId) {
 
 const lastZynSession = new Map(); // guildId -> { prompt, songs }
 
+// ── Lavalink helpers ──────────────────────────────────────────────────────────
+
+async function getOrCreatePlayer(message) {
+    const voiceChannel = message.member?.voice?.channel;
+    if (!voiceChannel) {
+        message.reply('You need to be in a voice channel!');
+        return null;
+    }
+
+    const player = lavalinkClient.createPlayer({
+        guildId: message.guild.id,
+        voiceChannelId: voiceChannel.id,
+        textChannelId: message.channel.id,
+        selfDeaf: true,
+        selfMute: false,
+        volume: 100,
+        node: 'main',
+    });
+
+    if (!player.connected) await player.connect();
+    return player;
+}
+
+// ── Search ranking ────────────────────────────────────────────────────────────
+
+const DEGRADED_TERMS = [
+    'cover', 'covers', 'covered',
+    'live', 'live version', 'live at', 'live from', 'live performance',
+    'acoustic', 'acoustic version',
+    'remix', 'remixed',
+    'slowed', 'slowed down', 'slowed + reverb',
+    'reverb', 'reverbed',
+    'sped up', 'nightcore',
+    'karaoke', 'instrumental',
+    'tribute', 'demo',
+];
+
+function pickBestTrack(tracks, query) {
+    const lq = query.toLowerCase();
+
+    // Terms the user explicitly requested — do not penalize these
+    const userWants = DEGRADED_TERMS.filter(t => lq.includes(t));
+    const penalize  = DEGRADED_TERMS.filter(t => !userWants.includes(t));
+
+    // Query words longer than 2 chars used for reward matching
+    const queryWords = lq.split(/\s+/).filter(w => w.length > 2);
+
+    // Median duration for sanity check (-8 if track deviates >25%)
+    const durations = tracks.map(t => t.info.duration).filter(d => d > 0).sort((a, b) => a - b);
+    const median = durations.length
+        ? durations[Math.floor(durations.length / 2)]
+        : 0;
+
+    const scored = tracks.map((track, index) => {
+        const title  = track.info.title.toLowerCase();
+        const author = track.info.author.toLowerCase();
+        let score = 0;
+
+        // Penalize degraded-version indicators not requested by user (-10 each)
+        for (const term of penalize) {
+            if (title.includes(term)) score -= 10;
+        }
+
+        // Reward query words present in title (+3) or author (+5)
+        for (const word of queryWords) {
+            if (title.includes(word))  score += 3;
+            if (author.includes(word)) score += 5;
+        }
+
+        // Exact match bonus: all query words appear somewhere in title + author (+10)
+        const combined = `${title} ${author}`;
+        if (queryWords.length > 0 && queryWords.every(w => combined.includes(w))) score += 10;
+
+        // Reward clean title — no parentheses or brackets (+2)
+        if (!/[(\[]/.test(track.info.title)) score += 2;
+
+        // Duration sanity check: penalize tracks >25% away from median (-8)
+        if (median > 0 && track.info.duration > 0) {
+            const deviation = Math.abs(track.info.duration - median) / median;
+            if (deviation > 0.25) score -= 8;
+        }
+
+        // VEVO / exact artist match bonus (+4)
+        if (author.includes('vevo') || (queryWords.length > 0 && queryWords.every(w => author.includes(w)))) {
+            score += 4;
+        }
+
+        // Small positional decay so SC's own ranking breaks ties (-0.5 per position)
+        score -= index * 0.5;
+
+        return { track, score };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    const gap = scored.length > 1 ? scored[0].score - scored[1].score : scored[0].score;
+    return { track: scored[0].track, gap };
+}
+
+async function searchAndQueue(player, query, requestedBy, { confidenceCheck = false } = {}) {
+    const isUrl = query.startsWith('http://') || query.startsWith('https://');
+    const searchQuery = isUrl ? query : `scsearch:${query}`;
+
+    const result = await player.search({ query: searchQuery }, requestedBy);
+
+    if (!result?.tracks?.length || result.loadType === 'error' || result.loadType === 'empty') {
+        return null;
+    }
+
+    let track;
+    if (isUrl) {
+        track = result.tracks[0];
+    } else {
+        const { track: best, gap } = pickBestTrack(result.tracks, query);
+        if (confidenceCheck && gap < 8) {
+            return {
+                weakMatch: true,
+                hint: `Couldn't find a confident match for **${query}**.\nTry adding the artist name — for example: \`!play ${query} <artist>\``,
+            };
+        }
+        track = best;
+    }
+
+    await player.queue.add(track);
+    if (!player.playing && !player.paused) await player.play({ paused: false });
+    return track;
+}
+
+// ── Format helpers ────────────────────────────────────────────────────────────
+
+function fmtMs(ms) {
+    if (!ms || ms < 0) return '0:00';
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    return `${m}:${String(s % 60).padStart(2, '0')}`;
+}
+
 // ── Bot ready ─────────────────────────────────────────────────────────────────
 
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
+    await lavalinkClient.init(client.user.id);
 });
+
+// ── Forward raw gateway packets to Lavalink ───────────────────────────────────
+
+client.on('raw', d => lavalinkClient.sendRawData(d));
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -177,123 +306,165 @@ client.on('messageCreate', async message => {
     const args = message.content.slice(1).trim().split(/ +/);
     const command = args.shift().toLowerCase();
 
+    // ── !ping ─────────────────────────────────────────────────────────────────
+
     if (command === 'ping') {
         message.reply('Pong!');
     }
 
-    if (command === 'play') {
-        const voiceChannel = message.member.voice.channel;
-        if (!voiceChannel) return message.reply('You need to be in a voice channel!');
+    // ── !play ─────────────────────────────────────────────────────────────────
 
+    if (command === 'play') {
         const query = args.join(' ');
         if (!query) return message.reply('Please provide a song name or URL!');
 
+        const player = await getOrCreatePlayer(message);
+        if (!player) return;
+
         try {
-            let url = query;
-            if (!query.startsWith('http://') && !query.startsWith('https://')) {
-                url = await searchYouTube(query);
-                if (!url) return message.reply(`No results found for **${query}**.`);
-            }
-            await distube.play(voiceChannel, url, {
-                message,
-                textChannel: message.channel,
-            });
+            const result = await searchAndQueue(player, query, message.member, { confidenceCheck: true });
+            if (!result) return message.reply(`No results found for **${query}**.`);
+            if (result.weakMatch) return message.reply(result.hint);
+            message.reply(`Queued **${result.info.title}** by ${result.info.author}.`);
         } catch (e) {
             console.error(e);
             message.reply(`Error: ${e.message}`);
         }
     }
 
+    // ── !stop ─────────────────────────────────────────────────────────────────
+
     if (command === 'stop') {
-        distube.stop(message.guild);
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player) return message.reply('Nothing is playing!');
+        await player.destroy();
         message.reply('Stopped the music!');
     }
 
+    // ── !skip ─────────────────────────────────────────────────────────────────
+
     if (command === 'skip') {
-        distube.skip(message.guild);
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player) return message.reply('Nothing is playing!');
+        await player.skip();
         message.reply('Skipped!');
     }
 
+    // ── !pause ────────────────────────────────────────────────────────────────
+
     if (command === 'pause') {
-        const queue = distube.getQueue(message.guild);
-        if (!queue) return message.reply('Nothing is playing!');
-        if (queue.paused) return message.reply('Already paused.');
-        queue.pause();
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player) return message.reply('Nothing is playing!');
+        if (player.paused) return message.reply('Already paused.');
+        await player.pause();
         message.reply('Paused.');
     }
 
+    // ── !resume ───────────────────────────────────────────────────────────────
+
     if (command === 'resume') {
-        const queue = distube.getQueue(message.guild);
-        if (!queue) return message.reply('Nothing is playing!');
-        if (!queue.paused) return message.reply('Not paused.');
-        queue.resume();
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player) return message.reply('Nothing is playing!');
+        if (!player.paused) return message.reply('Not paused.');
+        await player.resume();
         message.reply('Resumed.');
     }
 
+    // ── !volume ───────────────────────────────────────────────────────────────
+
     if (command === 'volume') {
-        const queue = distube.getQueue(message.guild);
-        if (!queue) return message.reply('Nothing is playing!');
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player) return message.reply('Nothing is playing!');
         const vol = parseInt(args[0]);
         if (isNaN(vol) || vol < 1 || vol > 100) return message.reply('Usage: `!volume 1-100`');
-        queue.setVolume(vol);
+        await player.setVolume(vol);
         message.reply(`Volume set to **${vol}%**.`);
     }
 
+    // ── !loop ─────────────────────────────────────────────────────────────────
+
     if (command === 'loop') {
-        const queue = distube.getQueue(message.guild);
-        if (!queue) return message.reply('Nothing is playing!');
-        const next = queue.repeatMode === RepeatMode.SONG ? RepeatMode.DISABLED : RepeatMode.SONG;
-        queue.setRepeatMode(next);
-        message.reply(next === RepeatMode.SONG ? 'Loop **on** for current song.' : 'Loop **off**.');
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player) return message.reply('Nothing is playing!');
+        const next = player.repeatMode === 'track' ? 'off' : 'track';
+        await player.setRepeatMode(next);
+        message.reply(next === 'track' ? 'Loop **on** for current song.' : 'Loop **off**.');
     }
+
+    // ── !remove ───────────────────────────────────────────────────────────────
 
     if (command === 'remove') {
-        const queue = distube.getQueue(message.guild);
-        if (!queue) return message.reply('Nothing is playing!');
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player) return message.reply('Nothing is playing!');
         const pos = parseInt(args[0]);
+        const upcoming = player.queue.tracks;
         if (isNaN(pos) || pos < 2) return message.reply('Usage: `!remove <number>` — position must be 2 or higher (1 is the current song).');
-        if (pos > queue.songs.length) return message.reply(`Only ${queue.songs.length} song(s) in the queue.`);
-        const removed = queue.songs.splice(pos - 1, 1)[0];
-        message.reply(`Removed **${removed.name}** from the queue.`);
+        if (pos - 1 > upcoming.length) return message.reply(`Only ${upcoming.length + 1} song(s) in the queue.`);
+        const removed = upcoming[pos - 2];
+        player.queue.splice(pos - 2, 1);
+        message.reply(`Removed **${removed.info.title}** from the queue.`);
     }
 
+    // ── !shuffle ──────────────────────────────────────────────────────────────
+
     if (command === 'shuffle') {
-        const queue = distube.getQueue(message.guild);
-        if (!queue) return message.reply('Nothing is playing!');
-        await queue.shuffle();
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player) return message.reply('Nothing is playing!');
+        await player.queue.shuffle();
         message.reply('Queue shuffled!');
     }
 
+    // ── !queue ────────────────────────────────────────────────────────────────
+
     if (command === 'queue') {
-        const queue = distube.getQueue(message.guild);
-        if (!queue || !queue.songs.length) return message.reply('Nothing is playing!');
-        const fmt = s => {
-            const t = Math.round(s.duration);
-            const m = Math.floor(t / 60);
-            const sec = String(t % 60).padStart(2, '0');
-            return `${m}:${sec}`;
-        };
-        const current = `**Now playing:** ${queue.songs[0].name} [${fmt(queue.songs[0])}]`;
-        const upcoming = queue.songs.slice(1)
-            .map((s, i) => `${i + 2}. ${s.name} [${fmt(s)}]`)
-            .join('\n') || 'No upcoming songs.';
-        message.reply(`${current}\n\n**Up next:**\n${upcoming}`);
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player?.queue?.current) return message.reply('Nothing is playing!');
+
+        const current = player.queue.current;
+        const upcoming = player.queue.tracks.slice(0, 10);
+        const total = player.queue.tracks.length;
+
+        const embed = new EmbedBuilder()
+            .setColor(0x1DB954)
+            .setTitle('Queue')
+            .setDescription(
+                `**Now playing:** ${current.info.title} — ${current.info.author} [${fmtMs(current.info.duration)}]` +
+                (upcoming.length
+                    ? '\n\n**Up next:**\n' + upcoming.map((t, i) =>
+                        `${i + 2}. ${t.info.title} — ${t.info.author} [${fmtMs(t.info.duration)}]`
+                    ).join('\n')
+                    : '\n\nNo upcoming songs.') +
+                (total > 10 ? `\n\n*…and ${total - 10} more*` : '')
+            );
+
+        message.reply({ embeds: [embed] });
     }
+
+    // ── !nowplaying ───────────────────────────────────────────────────────────
 
     if (command === 'nowplaying') {
-        const queue = distube.getQueue(message.guild);
-        if (!queue) return message.reply('Nothing is playing!');
-        const song = queue.songs[0];
-        const elapsed = Math.round(queue.currentTime);
-        const total = Math.round(song.duration);
-        const fmt = t => `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+        const player = lavalinkClient.getPlayer(message.guild.id);
+        if (!player?.queue?.current) return message.reply('Nothing is playing!');
+
+        const track = player.queue.current;
+        const pos = player.position ?? 0;
+        const dur = track.info.duration ?? 0;
         const barLen = 20;
-        const filled = total > 0 ? Math.round((elapsed / total) * barLen) : 0;
+        const filled = dur > 0 ? Math.round((pos / dur) * barLen) : 0;
         const bar = '▬'.repeat(filled) + '🔘' + '▬'.repeat(barLen - filled);
-        message.reply(`**${song.name}**\n${bar}\n${fmt(elapsed)} / ${fmt(total)}`);
+
+        const embed = new EmbedBuilder()
+            .setColor(0x1DB954)
+            .setTitle(track.info.title)
+            .setDescription(`${bar}\n${fmtMs(pos)} / ${fmtMs(dur)}`)
+            .setAuthor({ name: track.info.author });
+
+        if (track.info.artworkUrl) embed.setThumbnail(track.info.artworkUrl);
+
+        message.reply({ embeds: [embed] });
     }
 
-    // ── !zyn — AI-powered natural language commands ───────────────────────────
+    // ── !zyn ──────────────────────────────────────────────────────────────────
 
     if (command === 'zyn') {
         const subcommand = args[0]?.toLowerCase();
@@ -325,8 +496,8 @@ client.on('messageCreate', async message => {
 
         // ── !zyn suggest ──────────────────────────────────────────────────────
         if (subcommand === 'suggest') {
-            const queue = distube.getQueue(message.guild);
-            if (!queue) return message.reply('Nothing is playing! Start a queue first.');
+            const player = lavalinkClient.getPlayer(message.guild.id);
+            if (!player?.queue?.current) return message.reply('Nothing is playing! Start a queue first.');
 
             const voiceChannel = message.member?.voice?.channel;
             if (!voiceChannel) return message.reply('🔇 You need to be in a voice channel first!');
@@ -334,7 +505,8 @@ client.on('messageCreate', async message => {
             const limited = isRateLimited(message.author.id);
             if (limited) return message.reply(`⏳ Slow down! Try again in **${limited}s**.`);
 
-            const queueNames = queue.songs.slice(0, 10).map(s => s.name);
+            const queueNames = [player.queue.current, ...player.queue.tracks.slice(0, 9)]
+                .map(t => t.info.title);
             const thinkingMsg = await message.reply('🔍 Analyzing your queue...');
 
             try {
@@ -350,12 +522,8 @@ client.on('messageCreate', async message => {
                 for (const song of songs) {
                     const query = `${song.title} ${song.artist}`;
                     try {
-                        const url = await searchYouTube(query);
-                        if (!url) continue;
-                        await distube.play(voiceChannel, url, {
-                            member: message.member,
-                            textChannel: message.channel,
-                        });
+                        const track = await searchAndQueue(player, query, message.member);
+                        if (!track) continue;
                         queued.push(`**${song.title}** — ${song.artist}`);
                     } catch (e) {
                         console.error(`Failed to queue: ${query}`, e.message);
@@ -363,7 +531,7 @@ client.on('messageCreate', async message => {
                 }
 
                 if (!queued.length) {
-                    return thinkingMsg.edit("😬 Found suggestions but couldn't load any tracks. YouTube might be acting up.");
+                    return thinkingMsg.edit("😬 Found suggestions but couldn't load any tracks. Spotify might be acting up.");
                 }
 
                 const list = queued.map((s, i) => `${i + 1}. ${s}`).join('\n');
@@ -414,16 +582,15 @@ client.on('messageCreate', async message => {
                 return true;
             });
 
+            const player = await getOrCreatePlayer(message);
+            if (!player) return thinkingMsg.edit('🔇 You need to be in a voice channel first!');
+
             const queued = [];
             for (const song of dedupedSongs) {
                 const query = `${song.title} ${song.artist}`;
                 try {
-                    const url = await searchYouTube(query);
-                    if (!url) continue;
-                    await distube.play(voiceChannel, url, {
-                        member: message.member,
-                        textChannel: message.channel,
-                    });
+                    const track = await searchAndQueue(player, query, message.member);
+                    if (!track) continue;
                     queued.push(`**${song.title}** — ${song.artist}`);
                 } catch (e) {
                     console.error(`Failed to queue: ${query}`, e.message);
@@ -431,7 +598,7 @@ client.on('messageCreate', async message => {
             }
 
             if (!queued.length) {
-                return thinkingMsg.edit("😬 Found the vibe but couldn't load any tracks. YouTube might be acting up.");
+                return thinkingMsg.edit("😬 Found the vibe but couldn't load any tracks. Spotify might be acting up.");
             }
 
             lastZynSession.set(message.guild.id, { prompt: userRequest, songs: queued });
@@ -446,18 +613,39 @@ client.on('messageCreate', async message => {
     }
 });
 
-// ── DisTube events ────────────────────────────────────────────────────────────
+// ── Lavalink player events ────────────────────────────────────────────────────
 
-distube.on('initQueue', queue => {
-    queue.voice.setSelfDeaf(false);
+lavalinkClient.on('trackStart', (player, track) => {
+    const channel = client.channels.cache.get(player.textChannelId);
+    if (!channel) return;
+
+    const embed = new EmbedBuilder()
+        .setColor(0x1DB954)
+        .setTitle('Now Playing')
+        .setDescription(`**[${track.info.title}](${track.info.uri})**\n${track.info.author}`)
+        .addFields({ name: 'Duration', value: fmtMs(track.info.duration), inline: true });
+
+    if (track.info.artworkUrl) embed.setThumbnail(track.info.artworkUrl);
+
+    channel.send({ embeds: [embed] });
 });
 
-distube.on('playSong', (queue, song) => {
+lavalinkClient.on('queueEnd', async player => {
+    const channel = client.channels.cache.get(player.textChannelId);
+    channel?.send('Queue ended. Disconnecting.');
+    setTimeout(() => player.destroy().catch(() => {}), 1000);
 });
 
-distube.on('error', (error, queue, song) => {
-    console.error(error);
-    queue.textChannel?.send(`Something went wrong${song ? ` playing **${song.name}**` : ''}: ${error.message}`);
+lavalinkClient.on('playerException', (player, track, error) => {
+    console.error('Player exception:', error);
+    const channel = client.channels.cache.get(player.textChannelId);
+    channel?.send(`Something went wrong${track ? ` playing **${track.info.title}**` : ''}: ${error?.message ?? error}`);
 });
+
+lavalinkClient.on('playerSocketClosed', (player, payload) => {
+    console.warn(`Player socket closed for guild ${player.guildId}:`, payload);
+});
+
+// ── Login ─────────────────────────────────────────────────────────────────────
 
 client.login(DISCORD_TOKEN);
