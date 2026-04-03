@@ -291,7 +291,7 @@ function fmtMs(ms) {
 
 client.once('clientReady', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
-    await lavalinkClient.init(client.user.id);
+    await lavalinkClient.init({ id: client.user.id });
 });
 
 // ── Forward raw gateway packets to Lavalink ───────────────────────────────────
